@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WebSocket адаптер што ја замена WebRTC функционалноста
+Поедноставен WebSocket клиент без сложен threading
 """
 
 import asyncio
@@ -11,11 +11,11 @@ import queue
 import time
 from typing import Callable, Optional
 
-WEBRTC_AVAILABLE = True  # Симулирај дека WebRTC е достапен
+WEBRTC_AVAILABLE = True
 
 
 class WebRTCClient:
-    def __init__(self, signaling_server_url="ws://127.0.0.1:8765"):
+    def __init__(self, signaling_server_url="ws://127.0.0.1:8765"):  # Вратено на localhost
         self.signaling_url = signaling_server_url
         self.websocket = None
 
@@ -24,198 +24,206 @@ class WebRTCClient:
         self.is_host = False
         self.connection_state = "disconnected"
 
+        # Callbacks
         self.on_message_received: Optional[Callable] = None
         self.on_connection_state_change: Optional[Callable] = None
         self.on_peer_info_received: Optional[Callable] = None
 
-        self.loop = None
-        self.thread = None
+        # Поедноставен message queue
         self.message_queue = queue.Queue()
+        self.running = False
 
-        print("🔄 Using WebSocket adapter instead of WebRTC P2P")
-
-    def start_async_thread(self):
-        if self.thread and self.thread.is_alive():
-            return
-
-        def run_async_loop():
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            try:
-                self.loop.run_forever()
-            except Exception as e:
-                print(f"Error in async loop: {e}")
-            finally:
-                self.loop.close()
-
-        self.thread = threading.Thread(target=run_async_loop, daemon=True)
-        self.thread.start()
-
-        timeout = 10
-        start_time = time.time()
-        while (not self.loop or not self.loop.is_running()) and (time.time() - start_time < timeout):
-            time.sleep(0.1)
-
-    def stop_async_thread(self):
-        if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5.0)
+        print(f"Connecting to: {self.signaling_url}")
 
     def create_session(self, player_name="Host", player_avatar="🙂"):
+        """Создај сесија"""
         self.is_host = True
-        self.start_async_thread()
+        self.running = True
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._create_session_async(player_name, player_avatar),
-            self.loop
-        )
-        return future
+        def run_host():
+            try:
+                asyncio.run(self._create_session_async(player_name, player_avatar))
+            except Exception as e:
+                print(f"Host session error: {e}")
+                self.connection_state = "error"
+                if self.on_connection_state_change:
+                    self.on_connection_state_change("error")
 
-    def join_session(self, session_id_or_code, player_name="Guest", player_avatar="😎"):
+        thread = threading.Thread(target=run_host, daemon=True)
+        thread.start()
+        return thread
+
+    def join_session(self, invite_code, player_name="Guest", player_avatar="😎"):
+        """Приклучи се на сесија"""
         self.is_host = False
-        self.start_async_thread()
+        self.running = True
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._join_session_async(session_id_or_code, player_name, player_avatar),
-            self.loop
-        )
-        return future
+        def run_guest():
+            try:
+                asyncio.run(self._join_session_async(invite_code, player_name, player_avatar))
+            except Exception as e:
+                print(f"Guest session error: {e}")
+                self.connection_state = "error"
+                if self.on_connection_state_change:
+                    self.on_connection_state_change("error")
+
+        thread = threading.Thread(target=run_guest, daemon=True)
+        thread.start()
+        return thread
 
     async def _create_session_async(self, player_name, player_avatar):
+        """Async host сесија"""
         try:
-            print(f"Connecting to signaling server: {self.signaling_url}")
+            print("Connecting to signaling server...")
             self.websocket = await websockets.connect(self.signaling_url)
-            print("Connected to signaling server")
 
+            # Испрати create request
             await self.websocket.send(json.dumps({
                 "type": "create_session",
                 "player_name": player_name,
                 "player_avatar": player_avatar
             }))
 
-            print("Session creation request sent")
-            await self._handle_signaling_messages()
+            # Слушај пораки
+            await self._listen_for_messages()
 
         except Exception as e:
-            print(f"Error creating session: {e}")
-            raise
+            print(f"Create session error: {e}")
+            self.connection_state = "error"
+            if self.on_connection_state_change:
+                self.on_connection_state_change("error")
+        finally:
+            if self.websocket:
+                await self.websocket.close()
 
-    async def _join_session_async(self, session_id_or_code, player_name, player_avatar):
+    async def _join_session_async(self, invite_code, player_name, player_avatar):
+        """Async guest сесија"""
         try:
-            print(f"Connecting to signaling server: {self.signaling_url}")
+            print("Connecting to signaling server...")
             self.websocket = await websockets.connect(self.signaling_url)
-            print("Connected to signaling server")
 
-            join_data = {
+            # Испрати join request
+            await self.websocket.send(json.dumps({
                 "type": "join_session",
+                "invite_code": invite_code.upper(),
                 "player_name": player_name,
                 "player_avatar": player_avatar
-            }
+            }))
 
-            if len(session_id_or_code) == 8:
-                join_data["invite_code"] = session_id_or_code.upper()
-                print(f"Joining with invite code: {session_id_or_code}")
-            else:
-                join_data["session_id"] = session_id_or_code
-                print(f"Joining with session ID: {session_id_or_code}")
-
-            await self.websocket.send(json.dumps(join_data))
-            await self._handle_signaling_messages()
+            # Слушај пораки
+            await self._listen_for_messages()
 
         except Exception as e:
-            print(f"Error joining session: {e}")
-            raise
+            print(f"Join session error: {e}")
+            self.connection_state = "error"
+            if self.on_connection_state_change:
+                self.on_connection_state_change("error")
+        finally:
+            if self.websocket:
+                await self.websocket.close()
 
-    async def _handle_signaling_messages(self):
+    async def _listen_for_messages(self):
+        """Слушај за signaling пораки"""
         try:
             async for message in self.websocket:
+                if not self.running:
+                    break
+
                 data = json.loads(message)
                 message_type = data.get("type")
-                print(f"Received message: {message_type}")
+                print(f"Received: {message_type}")
 
                 if message_type == "session_created":
                     self.session_id = data.get("session_id")
                     self.invite_code = data.get("invite_code")
-                    print(f"✅ Session created with invite code: {self.invite_code}")
+                    print(f"Session created: {self.invite_code}")
 
+                    self.connection_state = "waiting_for_guest"
                     if self.on_connection_state_change:
                         self.on_connection_state_change("waiting_for_guest")
 
                 elif message_type == "guest_joined":
-                    print("✅ Guest joined")
                     guest_info = data.get("guest_info")
-
+                    print("Guest joined")
                     if self.on_peer_info_received:
                         self.on_peer_info_received(guest_info)
 
                 elif message_type == "session_joined":
                     self.session_id = data.get("session_id")
                     host_info = data.get("host_info")
-                    print(f"✅ Joined session: {self.session_id}")
-
+                    print("Session joined")
                     if self.on_peer_info_received:
                         self.on_peer_info_received(host_info)
 
                 elif message_type == "connection_established":
-                    print("✅ Connection established via WebSocket!")
+                    print("Connection established!")
                     self.connection_state = "connected"
-
                     if self.on_connection_state_change:
                         self.on_connection_state_change("connected")
 
                 elif message_type == "game_message":
                     game_data = data.get("data")
-                    print(f"📨 Received game message: {game_data.get('type', 'unknown')}")
-
+                    print(f"Game message: {game_data.get('type', 'unknown')}")
                     self.message_queue.put(game_data)
-
                     if self.on_message_received:
                         self.on_message_received(game_data)
 
                 elif message_type == "error":
                     error_msg = data.get("message", "Unknown error")
-                    print(f"❌ Error: {error_msg}")
-                    raise Exception(f"Signaling error: {error_msg}")
+                    print(f"Server error: {error_msg}")
+                    self.connection_state = "error"
+                    if self.on_connection_state_change:
+                        self.on_connection_state_change("error")
+                    break
 
                 elif message_type == "peer_disconnected":
-                    print("📤 Peer disconnected")
+                    print("Peer disconnected")
+                    self.connection_state = "peer_disconnected"
                     if self.on_connection_state_change:
                         self.on_connection_state_change("peer_disconnected")
+                    break
 
         except websockets.exceptions.ConnectionClosed:
-            print("WebSocket connection closed")
+            print("Connection closed")
         except Exception as e:
-            print(f"Error in signaling: {e}")
-            raise
+            print(f"Listen error: {e}")
 
     def send_message(self, message_dict):
+        """Испрати порака преку нов async call"""
         if not self.websocket or self.connection_state != "connected":
-            print("⚠️ WebSocket not ready for sending")
+            print("Not ready to send message")
             return False
 
-        if self.loop and self.loop.is_running():
+        def send_async():
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self._send_game_message(message_dict),
-                    self.loop
-                )
+                asyncio.run(self._send_message_async(message_dict))
                 return True
             except Exception as e:
-                print(f"❌ Error sending message: {e}")
+                print(f"Send error: {e}")
                 return False
-        return False
 
-    async def _send_game_message(self, message_dict):
-        if self.websocket:
-            await self.websocket.send(json.dumps({
-                "type": "game_message",
-                "session_id": self.session_id,
-                "data": message_dict
-            }))
-            print(f"📤 Sent game message: {message_dict.get('type', 'unknown')}")
+        thread = threading.Thread(target=send_async, daemon=True)
+        thread.start()
+        return True
+
+    async def _send_message_async(self, message_dict):
+        """Async испраќање на порaka"""
+        if self.websocket and self.connection_state == "connected":
+            try:
+                # Поврзи се повторно за испраќање
+                temp_ws = await websockets.connect(self.signaling_url)
+                await temp_ws.send(json.dumps({
+                    "type": "game_message",
+                    "session_id": self.session_id,
+                    "data": message_dict
+                }))
+                await temp_ws.close()
+                print(f"Sent: {message_dict.get('type', 'unknown')}")
+            except Exception as e:
+                print(f"Send message error: {e}")
 
     def get_pending_messages(self):
+        """Земи pending пораки"""
         messages = []
         try:
             while True:
@@ -226,12 +234,9 @@ class WebRTCClient:
         return messages
 
     def close(self):
-        print("🛑 Closing WebSocket client...")
-
-        if self.loop and self.loop.is_running():
-            if self.websocket:
-                asyncio.run_coroutine_threadsafe(self.websocket.close(), self.loop)
-
-        self.stop_async_thread()
+        """Едноставно затворање"""
+        print("Closing WebSocket client...")
+        self.running = False
         self.connection_state = "disconnected"
-        print("✅ WebSocket client closed")
+        # Не се обидуваме да затвориме websocket тука - ќе се затвори автоматски
+        print("WebSocket client closed")

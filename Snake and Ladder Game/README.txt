@@ -27,3 +27,15 @@ Core libraries:
 
 # Or install from requirements.txt
 - pip install -r requirements.txt
+
+HOST:
+webrtc_client.py ("ws://127.0.0.1:8765")
+python http_websocket_server.py
+ngrok http 8765
+python start_game.py
+option: 2
+
+CLIENT:
+webrtc_client.py ("ws://cfb21a011d26.ngrok-free.app/:8765")
+python start_game.py
+option: 2

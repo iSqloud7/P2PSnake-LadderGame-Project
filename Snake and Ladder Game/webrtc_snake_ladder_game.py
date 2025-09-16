@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Модифицирана верзија на SnakeLadderGame што работи со P2P WebRTC комуникација
-наместо традиционални WebSocket серверски врски
+Исправена P2P Snake & Ladder игра со правилна синхронизација
 """
 
 import tkinter as tk
@@ -13,7 +12,7 @@ import math
 import time
 import json
 
-# Увези го оригиналниот game код за основните константи
+# Константи
 BOARD_SIZE = 640
 TILE_SIZE = BOARD_SIZE // 10
 BOARD_MARGIN = 40
@@ -25,8 +24,7 @@ LADDERS = {1: 38, 4: 14, 9: 21, 28: 84, 36: 44, 51: 67, 71: 91, 80: 100}
 
 class P2PSnakeLadderGame:
     """
-    Верзија на Snake & Ladder игра што користи P2P комуникација
-    наместо централизиран сервер
+    P2P верзија со исправена синхронизација
     """
 
     def __init__(self, root,
@@ -58,13 +56,21 @@ class P2PSnakeLadderGame:
         # Локални статистики
         self.local_score = self.load_local_score()
 
-        # Состојби за P2P синхронизација
+        # P2P синхронизација
         self.game_state_synced = True
         self.pending_moves = []
         self.message_buffer = []
+        self.message_check_interval = 100
 
-        # Периодично процесирање на P2P пораки
-        self.message_check_interval = 100  # milliseconds
+        # Игрална логика
+        self.positions = [0, 0]
+        self.dice_value = 0
+        self.current_player = 0  # 0 = host, 1 = guest
+        self.movable = False
+        self.my_player_index = 0 if self.is_host else 1  # Мој индекс
+
+        # За P2P - чекаме confirmation пред switch_turn
+        self.waiting_for_move_confirmation = False
 
         # Иницијализирај UI прво
         self.setup_ui()
@@ -79,7 +85,7 @@ class P2PSnakeLadderGame:
         self.root.lift()
 
     def setup_ui(self):
-        """Setup UI (исто како оригинал)"""
+        """Setup UI"""
         # Постави минимална големина
         self.root.geometry("1000x800")
 
@@ -131,17 +137,17 @@ class P2PSnakeLadderGame:
         ]
 
         self.dice_value = 0
-        self.current_player = 0
+        self.current_player = 0  # Host винаги започнува
         self.movable = False
+        self.waiting_for_move_confirmation = False
 
         self.setup_controls()
         self.move_token(0)
         self.move_token(1)
 
-        # Bind кликови на токени - само за свој токен во P2P мод
+        # Bind кликови на токени - само за свој токен
         if not self.singleplayer:
-            my_player_index = 0 if self.is_host else 1
-            if my_player_index == 0:
+            if self.my_player_index == 0:
                 self.canvas.tag_bind("player0", "<Button-1>", lambda e: self.try_move(0))
             else:
                 self.canvas.tag_bind("player1", "<Button-1>", lambda e: self.try_move(1))
@@ -153,20 +159,16 @@ class P2PSnakeLadderGame:
         # P2P иницијализација
         if self.p2p_connection:
             self.send_p2p_message({
-                "type": "player_info",
-                "name": self.player_names[0] if self.is_host else self.player_names[1],
-                "avatar": self.player_avatars[0] if self.is_host else self.player_avatars[1]
+                "type": "player_ready",
+                "player_index": self.my_player_index,
+                "name": self.player_names[self.my_player_index],
+                "avatar": self.player_avatars[self.my_player_index]
             })
 
-        # Поставување на почетен статус
-        if not self.singleplayer:
-            if self.is_host:
-                self.status_label.config(text="Your turn - Roll the dice!")
-            else:
-                self.status_label.config(text="Waiting for Host to start")
+        self.update_turn_status()
 
     def setup_controls(self):
-        """Setup контроли (исто како оригинал)"""
+        """Setup контроли"""
         # Title
         title_frame = tk.Frame(self.controls_frame, bg="#34495e")
         title_frame.pack(pady=15, fill="x")
@@ -210,15 +212,15 @@ class P2PSnakeLadderGame:
         self.reset_button.pack(pady=5)
 
         # Status
-        self.status_label = tk.Label(self.controls_frame, text=f"{self.player_names[0]}'s turn",
+        self.status_label = tk.Label(self.controls_frame, text="Starting game...",
                                      font=("Arial", 14, "bold"), bg="#34495e", fg="#f1c40f",
                                      wraplength=250, justify="center")
         self.status_label.pack(pady=15)
 
-        # Connection status за P2P
+        # Debug info за P2P
         if not self.singleplayer:
-            connection_status = "🟢 P2P Connected" if self.p2p_connection else "🔴 Disconnected"
-            tk.Label(self.controls_frame, text=connection_status, font=("Arial", 10),
+            role_text = "Host (Red)" if self.is_host else "Guest (Blue)"
+            tk.Label(self.controls_frame, text=f"You are: {role_text}", font=("Arial", 10),
                      bg="#34495e", fg="#ecf0f1").pack()
 
         # Локални поени за singleplayer
@@ -226,7 +228,7 @@ class P2PSnakeLadderGame:
             self.show_local_score()
 
     def show_local_score(self):
-        """Прикажи локални статистики (исто како оригинал)"""
+        """Прикажи локални статистики"""
         score_frame = tk.Frame(self.controls_frame, bg="#2c3e50", relief=tk.SUNKEN, bd=2)
         score_frame.pack(pady=10, padx=10, fill="x")
 
@@ -251,6 +253,7 @@ class P2PSnakeLadderGame:
         """Испрати P2P порака"""
         if self.p2p_connection:
             try:
+                print(f"Sending P2P: {message_dict.get('type')}")
                 return self.p2p_connection.send_message(message_dict)
             except Exception as e:
                 print(f"Error sending P2P message: {e}")
@@ -274,72 +277,73 @@ class P2PSnakeLadderGame:
         """Обработка на примени P2P пораки"""
         try:
             message_type = message.get("type")
+            print(f"Received P2P: {message_type}")
 
-            if message_type == "player_info":
-                # Ажурирај информации за другиот играч
+            if message_type == "player_ready":
+                player_index = message.get("player_index")
                 name = message.get("name", "Player")
                 avatar = message.get("avatar", "😎")
+                self.update_player_info(player_index, name, avatar)
 
-                if self.is_host:
-                    self.update_player_info(1, name, avatar)
-                else:
-                    self.update_player_info(0, name, avatar)
-
-            elif message_type == "roll":
-                # Другиот играч фрли коцка
+            elif message_type == "dice_roll":
                 dice_value = int(message.get("value", 1))
-                self.handle_remote_dice_roll(dice_value)
-
-            elif message_type == "move":
-                # Другиот играч се движи
                 player = int(message.get("player", 0))
-                from_pos = int(message.get("from_pos", 0))
-                to_pos = int(message.get("to_pos", 1))
-                self.handle_remote_move(player, from_pos, to_pos)
+                self.handle_remote_dice_roll(player, dice_value)
 
-            elif message_type == "game_state":
-                # Синхронизација на состојба на игра
+            elif message_type == "player_move":
+                player = int(message.get("player", 0))
+                new_position = int(message.get("new_position", 0))
+                self.handle_remote_move(player, new_position)
+
+            elif message_type == "move_complete":
+                player = int(message.get("player", 0))
+                self.handle_move_complete(player)
+
+            elif message_type == "game_sync":
                 self.sync_game_state(message.get("state", {}))
 
             elif message_type == "reset":
-                # Другиот играч resetира игра
                 self.reset_game()
-
-            elif message_type == "chat":
-                # Chat порака (опционално)
-                chat_msg = message.get("message", "")
-                self.show_chat_message(message.get("from", "Player"), chat_msg)
 
         except Exception as e:
             print(f"Error handling P2P message: {e}")
 
-    def handle_remote_dice_roll(self, dice_value):
+    def handle_remote_dice_roll(self, player, dice_value):
         """Обработка на remote dice roll"""
-        if not self.singleplayer:
+        if not self.singleplayer and player != self.my_player_index:
             self.dice_value = dice_value
             if 1 <= dice_value <= 6:
                 self.dice_label.config(image=self.dice_images[dice_value - 1])
 
-            # Не go прави movable за локалниот играч
-            # self.movable = True  # Ова треба да се отстрани
+            self.status_label.config(text=f"{self.player_names[player]} rolled {dice_value}")
+            print(f"Remote player {player} rolled {dice_value}")
 
-            other_player_index = 1 if self.is_host else 0
-            self.status_label.config(text=f"{self.player_names[other_player_index]} rolled {dice_value}")
-
-    def handle_remote_move(self, player, from_pos, to_pos):
+    def handle_remote_move(self, player, new_position):
         """Обработка на remote движење"""
-        if not self.singleplayer:
-            # Прими го движењето од другиот играч
-            other_player_index = 1 if self.is_host else 0
-            if player == other_player_index:
-                self.positions[player] = to_pos
-                self.move_token(player)
+        if not self.singleplayer and player != self.my_player_index:
+            print(f"Remote move: Player {player} to position {new_position}")
 
-                # Провери за крај на игра
-                if to_pos == 100:
-                    self.handle_victory(player)
-                else:
-                    self.switch_turn()
+            # Ажурирај позиција
+            self.positions[player] = new_position
+            self.move_token(player)
+
+            # Испрати confirmation
+            self.send_p2p_message({
+                "type": "move_complete",
+                "player": player
+            })
+
+    def handle_move_complete(self, player):
+        """Обработка на завршен потег"""
+        if self.waiting_for_move_confirmation and player != self.my_player_index:
+            print(f"Move confirmed for player {player}")
+            self.waiting_for_move_confirmation = False
+
+            # Провери за победа
+            if self.positions[player] >= 100:
+                self.handle_victory(player)
+            else:
+                self.switch_turn()
 
     def sync_game_state(self, state):
         """Синхронизирај состојба на игра"""
@@ -351,25 +355,255 @@ class P2PSnakeLadderGame:
 
             if "current_player" in state:
                 self.current_player = state["current_player"]
-
-                # Ажурирај статус според тоа чиј ред е
-                if not self.singleplayer:
-                    my_player_index = 0 if self.is_host else 1
-                    if self.current_player == my_player_index:
-                        self.status_label.config(text="Your turn - Roll the dice!")
-                    else:
-                        other_player_index = 1 if self.is_host else 0
-                        self.status_label.config(text=f"Waiting for {self.player_names[other_player_index]}")
-
-            if "dice_value" in state and state["dice_value"] > 0:
-                self.dice_value = state["dice_value"]
-                if 1 <= self.dice_value <= 6:
-                    self.dice_label.config(image=self.dice_images[self.dice_value - 1])
+                self.update_turn_status()
 
         except Exception as e:
             print(f"Error syncing game state: {e}")
 
-    # ---------- Local Score Methods (исто како оригинал) ----------
+    def update_turn_status(self):
+        """Ажурирај статус за ред"""
+        if not self.singleplayer:
+            if self.current_player == self.my_player_index:
+                self.status_label.config(text="Your turn - Roll the dice!")
+                self.roll_button.config(state=tk.NORMAL)
+            else:
+                opponent_name = self.player_names[1 - self.my_player_index]
+                self.status_label.config(text=f"Waiting for {opponent_name}")
+                self.roll_button.config(state=tk.DISABLED)
+        else:
+            self.status_label.config(text=f"{self.player_names[self.current_player]}'s turn")
+
+    # ---------- Game Logic Methods ----------
+    def roll_dice(self):
+        """Фрли коцка"""
+        if self.movable or self.waiting_for_move_confirmation:
+            self.status_label.config(text="Complete your move first!")
+            return
+
+        # Провери дали е твој ред
+        if not self.singleplayer and self.current_player != self.my_player_index:
+            self.status_label.config(text="Wait for your turn!")
+            return
+
+        self.roll_button.config(state=tk.DISABLED)
+        self.animate_dice()
+
+    def animate_dice(self, frame=0):
+        """Анимација на коцка"""
+        if frame < 15:
+            value = random.randint(1, 6)
+            self.dice_label.config(image=self.dice_images[value - 1])
+            self.root.after(80, lambda: self.animate_dice(frame + 1))
+        else:
+            self.dice_value = random.randint(1, 6)
+            self.dice_label.config(image=self.dice_images[self.dice_value - 1])
+
+            # Испрати dice roll до другиот играч
+            if not self.singleplayer:
+                self.send_p2p_message({
+                    "type": "dice_roll",
+                    "player": self.current_player,
+                    "value": self.dice_value
+                })
+
+            # Овозможи движење
+            self.movable = True
+            self.status_label.config(text=f"You rolled {self.dice_value}. Click your token to move.")
+
+            # Автоматско движење за бот
+            if self.singleplayer and self.current_player == 1:
+                self.root.after(800, lambda: self.try_move(1))
+
+    def try_move(self, player):
+        """Обиди се да се движиш"""
+        # Во P2P мод, играчот може да движи само свој токен во свој ред
+        if not self.singleplayer:
+            if player != self.my_player_index or self.current_player != self.my_player_index:
+                self.status_label.config(text="Wait for your turn!")
+                return
+
+        if player != self.current_player or not self.movable:
+            return
+
+        current_pos = self.positions[player]
+        next_pos = current_pos + self.dice_value
+
+        if current_pos == 0:
+            next_pos = self.dice_value
+
+        if next_pos > 100:
+            self.status_label.config(text="Overshot! Turn passes.")
+            self.movable = False
+            if not self.singleplayer:
+                self.switch_turn()
+            else:
+                self.switch_turn()
+            return
+
+        self.total_moves[player] += 1
+
+        # Започни анимација на движење
+        self.animate_token_move(player, current_pos, next_pos)
+
+    def animate_token_move(self, player, start_pos, end_pos, step=0):
+        """Анимација на движење на токен"""
+        if step < (end_pos - start_pos):
+            intermediate_pos = start_pos + step + 1
+            self.positions[player] = intermediate_pos
+            self.move_token(player)
+            self.root.after(100, lambda: self.animate_token_move(player, start_pos, end_pos, step + 1))
+        else:
+            # Завршена основна анимација, провери за змии/скали
+            final_pos = end_pos
+
+            if final_pos in LADDERS:
+                self.status_label.config(text=f"{self.player_names[player]} climbed a ladder!")
+                ladder_top = LADDERS[final_pos]
+                self.root.after(500, lambda: self.animate_special_move(player, final_pos, ladder_top))
+                return
+            elif final_pos in SNAKES:
+                self.status_label.config(text=f"{self.player_names[player]} was bitten by a snake!")
+                snake_tail = SNAKES[final_pos]
+                self.root.after(500, lambda: self.animate_special_move(player, final_pos, snake_tail))
+                return
+
+            self.positions[player] = final_pos
+            self.move_token(player)
+            self.movable = False
+
+            # Испрати движење до другиот играч
+            if not self.singleplayer and player == self.my_player_index:
+                self.waiting_for_move_confirmation = True
+                self.send_p2p_message({
+                    "type": "player_move",
+                    "player": player,
+                    "new_position": final_pos
+                })
+
+            if final_pos >= 100:
+                self.handle_victory(player)
+            elif self.singleplayer or player == self.my_player_index:
+                if not self.waiting_for_move_confirmation:
+                    self.switch_turn()
+
+    def animate_special_move(self, player, from_pos, to_pos):
+        """Анимација за специјални движења (змии/скали)"""
+        self.positions[player] = to_pos
+        self.move_token(player)
+        self.movable = False
+
+        # Испрати движење до другиот играч
+        if not self.singleplayer and player == self.my_player_index:
+            self.waiting_for_move_confirmation = True
+            self.send_p2p_message({
+                "type": "player_move",
+                "player": player,
+                "new_position": to_pos
+            })
+
+        if to_pos >= 100:
+            self.handle_victory(player)
+        elif self.singleplayer or player == self.my_player_index:
+            if not self.waiting_for_move_confirmation:
+                self.switch_turn()
+
+    def move_token(self, player):
+        """Движење на токен"""
+        if self.positions[player] <= 0:
+            if player == 0:
+                x, y = 15, BOARD_SIZE + BOARD_MARGIN - 40
+            else:
+                x, y = BOARD_SIZE + BOARD_MARGIN * 2 - 15, BOARD_SIZE + BOARD_MARGIN - 40
+        else:
+            x, y = self.get_tile_center_coords(self.positions[player])
+
+        if player == 0:
+            offset_x, offset_y = -8, -8
+        else:
+            offset_x, offset_y = 8, 8
+
+        self.canvas.coords(self.tokens[player],
+                           x + offset_x - 12, y + offset_y - 12,
+                           x + offset_x + 12, y + offset_y + 12)
+
+        if self.positions[player] <= 0:
+            label_y = y + offset_y - 30
+        else:
+            label_y = y + offset_y - 30
+
+        self.canvas.coords(self.labels[player], x + offset_x, label_y)
+
+    def handle_victory(self, player):
+        """Обработка на победа"""
+        winner_name = self.player_names[player]
+        self.status_label.config(text=f"🎉 {winner_name} WINS! 🎉")
+        self.roll_button.config(state=tk.DISABLED)
+
+        duration = int(time.time() - self.start_time)
+
+        if self.singleplayer:
+            if player == 0:
+                self.save_local_score("win", duration)
+            else:
+                self.save_local_score("loss")
+
+        choice = messagebox.askquestion("Game Over",
+                                        f"{winner_name} wins!\nGame duration: {duration}s\nPlay again?",
+                                        icon='question')
+        if choice == "yes":
+            self.reset_game()
+            if not self.singleplayer:
+                self.send_p2p_message({"type": "reset"})
+        else:
+            if callable(self.on_game_end):
+                self.on_game_end(player)
+            self.root.quit()
+
+    def switch_turn(self):
+        """Смени ред"""
+        self.current_player = 1 - self.current_player
+        self.update_turn_status()
+
+        # Синхронизирај состојба во P2P мод
+        if not self.singleplayer:
+            self.send_p2p_message({
+                "type": "game_sync",
+                "state": {
+                    "positions": self.positions,
+                    "current_player": self.current_player
+                }
+            })
+
+        if self.singleplayer and self.current_player == 1:
+            self.root.after(1000, self.roll_dice)
+
+    def reset_game(self):
+        """Resetiraj игра"""
+        self.positions = [0, 0]
+        self.move_token(0)
+        self.move_token(1)
+        self.current_player = 0
+        self.movable = False
+        self.waiting_for_move_confirmation = False
+        self.update_turn_status()
+        self.dice_label.config(image='')
+        self.total_moves = [0, 0]
+        self.start_time = time.time()
+
+    def update_player_info(self, player_idx, name, avatar):
+        """Ажурирај информации за играч"""
+        if 0 <= player_idx < len(self.player_names):
+            self.player_names[player_idx] = name
+            self.player_avatars[player_idx] = avatar
+
+            if hasattr(self, 'player_labels') and player_idx < len(self.player_labels):
+                color = "#e74c3c" if player_idx == 0 else "#3498db"
+                self.player_labels[player_idx].config(text=f"{avatar} {name}", fg=color)
+
+            if player_idx < len(self.labels):
+                self.canvas.itemconfig(self.labels[player_idx], text=avatar)
+
+    # ---------- Local Score Methods ----------
     def load_local_score(self):
         """Вчитај локални поени"""
         try:
@@ -398,7 +632,7 @@ class P2PSnakeLadderGame:
         except:
             pass
 
-    # ---------- Dice and Image Methods (исто како оригинал) ----------
+    # ---------- Image and Board Methods ----------
     def create_dice_image(self, value, size=70):
         """Создај слика на коцка"""
         img = Image.new('RGB', (size, size), '#ecf0f1')
@@ -473,7 +707,6 @@ class P2PSnakeLadderGame:
             draw.rectangle([25, y, 55, y + 3], fill='#A0522D', outline='#654321', width=1)
         return img
 
-    # ---------- Board Drawing Methods (исто како оригинал) ----------
     def draw_board(self):
         """Цртај табла"""
         colors = ['#3498db', '#5dade2', '#85c1e9', '#aed6f1', '#d6eaf8', '#ebf5fb']
@@ -594,248 +827,6 @@ class P2PSnakeLadderGame:
         except Exception:
             pass
 
-    # ---------- Game Logic Methods ----------
-    def roll_dice(self):
-        """Фрли коцка"""
-        if self.movable:
-            self.status_label.config(text="Move your token first!")
-            return
-
-        # Провери дали е твој ред во P2P мод
-        if not self.singleplayer:
-            my_player_index = 0 if self.is_host else 1
-            if self.current_player != my_player_index:
-                self.status_label.config(text="Wait for opponent's turn.")
-                return
-
-        self.roll_button.config(state=tk.DISABLED)
-        self.animate_dice()
-
-    def animate_dice(self, frame=0):
-        """Анимација на коцка"""
-        if frame < 15:
-            value = random.randint(1, 6)
-            self.dice_label.config(image=self.dice_images[value - 1])
-            self.root.after(80, lambda: self.animate_dice(frame + 1))
-        else:
-            self.dice_value = random.randint(1, 6)
-            self.dice_label.config(image=self.dice_images[self.dice_value - 1])
-
-            # Во P2P мод, само играчот што фрли коцка може да се движи
-            if not self.singleplayer:
-                my_player_index = 0 if self.is_host else 1
-                if self.current_player == my_player_index:
-                    self.status_label.config(text=f"You rolled {self.dice_value}. Click your token to move.")
-                    self.movable = True
-            else:
-                self.status_label.config(
-                    text=f"{self.player_names[self.current_player]} rolled {self.dice_value}.\nClick your token to move.")
-                self.movable = True
-
-            self.roll_button.config(state=tk.NORMAL)
-
-            # Испрати P2P порака за dice roll
-            if not self.singleplayer:
-                self.send_p2p_message({"type": "roll", "value": self.dice_value})
-
-            # Автоматско движење за бот
-            if self.singleplayer and self.current_player == 1:
-                self.root.after(800, lambda: self.try_move(1))
-
-    def try_move(self, player):
-        """Обиди се да се движиш"""
-        # Во P2P мод, играчот може да движи само свој токен
-        if not self.singleplayer:
-            my_player_index = 0 if self.is_host else 1
-            if player != my_player_index:
-                self.status_label.config(text="You can only move your own token!")
-                return
-
-        if player != self.current_player or not self.movable:
-            self.status_label.config(text=f"It's {self.player_names[self.current_player]}'s turn!")
-            return
-
-        current_pos = self.positions[player]
-        next_pos = current_pos + self.dice_value
-
-        if current_pos == 0:
-            next_pos = self.dice_value
-
-        if next_pos > 100:
-            self.status_label.config(text=f"{self.player_names[player]} overshot! Turn passes.")
-            self.movable = False
-            self.switch_turn()
-            return
-
-        self.total_moves[player] += 1
-
-        # Испрати P2P порака за движење
-        if not self.singleplayer:
-            self.send_p2p_message({
-                "type": "move",
-                "player": player,
-                "from_pos": current_pos,
-                "to_pos": next_pos
-            })
-
-        self.animate_token_move(player, current_pos, next_pos)
-
-    def animate_token_move(self, player, start_pos, end_pos, step=0):
-        """Анимација на движење на токен"""
-        if step < (end_pos - start_pos):
-            intermediate_pos = start_pos + step + 1
-            self.positions[player] = intermediate_pos
-            self.move_token(player)
-            self.root.after(100, lambda: self.animate_token_move(player, start_pos, end_pos, step + 1))
-        else:
-            final_pos = end_pos
-
-            if final_pos in LADDERS:
-                self.status_label.config(text=f"{self.player_names[player]} climbed a ladder!")
-                ladder_top = LADDERS[final_pos]
-                self.root.after(500, lambda: self.animate_special_move(player, final_pos, ladder_top))
-                return
-            elif final_pos in SNAKES:
-                self.status_label.config(text=f"{self.player_names[player]} was bitten by a snake!")
-                snake_tail = SNAKES[final_pos]
-                self.root.after(500, lambda: self.animate_special_move(player, final_pos, snake_tail))
-                return
-
-            self.positions[player] = final_pos
-            self.move_token(player)
-            self.movable = False
-
-            if final_pos == 100:
-                self.handle_victory(player)
-            else:
-                self.switch_turn()
-
-    def animate_special_move(self, player, from_pos, to_pos):
-        """Анимација за специјални движења (змии/скали)"""
-        self.positions[player] = to_pos
-        self.move_token(player)
-        self.movable = False
-
-        if to_pos == 100:
-            self.handle_victory(player)
-        else:
-            self.switch_turn()
-
-    def move_token(self, player):
-        """Движење на токен"""
-        if self.positions[player] <= 0:
-            if player == 0:
-                x, y = 15, BOARD_SIZE + BOARD_MARGIN - 40
-            else:
-                x, y = BOARD_SIZE + BOARD_MARGIN * 2 - 15, BOARD_SIZE + BOARD_MARGIN - 40
-        else:
-            x, y = self.get_tile_center_coords(self.positions[player])
-
-        if player == 0:
-            offset_x, offset_y = -8, -8
-        else:
-            offset_x, offset_y = 8, 8
-
-        self.canvas.coords(self.tokens[player],
-                           x + offset_x - 12, y + offset_y - 12,
-                           x + offset_x + 12, y + offset_y + 12)
-
-        if self.positions[player] <= 0:
-            label_y = y + offset_y - 30
-        else:
-            label_y = y + offset_y - 30
-
-        self.canvas.coords(self.labels[player], x + offset_x, label_y)
-
-    def handle_victory(self, player):
-        """Обработка на победа"""
-        winner_name = self.player_names[player]
-        self.status_label.config(text=f"🎉 {winner_name} WINS! 🎉")
-        self.roll_button.config(state=tk.DISABLED)
-
-        duration = int(time.time() - self.start_time)
-
-        if self.singleplayer:
-            if player == 0:
-                self.save_local_score("win", duration)
-            else:
-                self.save_local_score("loss")
-
-        choice = messagebox.askquestion("Game Over",
-                                        f"{winner_name} wins!\nGame duration: {duration}s\nPlay again?",
-                                        icon='question')
-        if choice == "yes":
-            self.reset_game()
-            if not self.singleplayer:
-                self.send_p2p_message({"type": "reset"})
-        else:
-            if callable(self.on_game_end):
-                self.on_game_end(player)
-            self.root.quit()
-
-    def switch_turn(self):
-        """Смени ред"""
-        self.current_player = 1 - self.current_player
-
-        # Ажурирај статус според тоа чиј ред е
-        if not self.singleplayer:
-            my_player_index = 0 if self.is_host else 1
-            if self.current_player == my_player_index:
-                self.status_label.config(text="Your turn - Roll the dice!")
-            else:
-                other_player_index = 1 if self.is_host else 0
-                self.status_label.config(text=f"Waiting for {self.player_names[other_player_index]}")
-        else:
-            self.status_label.config(text=f"{self.player_names[self.current_player]}'s turn")
-
-        # Синхронизирај состојба во P2P мод - испраќај само кога си на ред
-        if not self.singleplayer:
-            my_player_index = 0 if self.is_host else 1
-            # Само играчот што завршува потег треба да испраќа sync
-            if (self.current_player - 1) % 2 == my_player_index:
-                self.send_p2p_message({
-                    "type": "game_state",
-                    "state": {
-                        "positions": self.positions,
-                        "current_player": self.current_player,
-                        "dice_value": 0  # Ресетирај dice value за нов потег
-                    }
-                })
-
-        if self.singleplayer and self.current_player == 1:
-            self.root.after(1000, self.roll_dice)
-
-    def reset_game(self):
-        """Resetiraj игра"""
-        self.positions = [0, 0]
-        self.move_token(0)
-        self.move_token(1)
-        self.current_player = 0
-        self.movable = False
-        self.status_label.config(text=f"{self.player_names[0]}'s turn")
-        self.dice_label.config(image='')
-        self.roll_button.config(state=tk.NORMAL)
-        self.total_moves = [0, 0]
-        self.start_time = time.time()
-
-    def update_player_info(self, player_idx, name, avatar):
-        """Ажурирај информации за играч"""
-        if 0 <= player_idx < len(self.player_names):
-            self.player_names[player_idx] = name
-            self.player_avatars[player_idx] = avatar
-
-            if hasattr(self, 'player_labels') and player_idx < len(self.player_labels):
-                color = "#e74c3c" if player_idx == 0 else "#3498db"
-                self.player_labels[player_idx].config(text=f"{avatar} {name}", fg=color)
-
-            if player_idx < len(self.labels):
-                self.canvas.itemconfig(self.labels[player_idx], text=avatar)
-
-    def show_chat_message(self, from_player, message):
-        """Прикажи chat порака (опционална функција)"""
-        print(f"Chat from {from_player}: {message}")
-
-    # ---------- Compatibility method for original game integration ----------
     def on_ws_message(self, message):
         """Compatibility метод за интеграција со постоечкиот код"""
         try:
