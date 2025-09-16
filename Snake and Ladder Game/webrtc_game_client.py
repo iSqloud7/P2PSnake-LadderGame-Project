@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Модифицирана верзија на GameClient што користи WebRTC за P2P комуникација
-наместо централизиран WebSocket сервер
+СО ФУНКЦИОНАЛЕН LOGIN СИСТЕМ
 """
 
 import tkinter as tk
@@ -11,10 +11,11 @@ import json
 import time
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Увези го оригиналниот код
 from webrtc_snake_ladder_game import P2PSnakeLadderGame as SnakeLadderGame
-
 
 SERVER_URL = "http://localhost:8000"
 
@@ -25,7 +26,7 @@ except ImportError:
     WEBRTC_AVAILABLE = False
 
 
-# Увези локални функции (од оригиналниот client.py)
+# Локални функции
 def load_local_profile():
     """Вчитај локален профил од датотека"""
     try:
@@ -46,13 +47,41 @@ def save_local_profile(profile):
         pass
 
 
+def create_session():
+    """Создај HTTP сесија со retry логика"""
+    session = requests.Session()
+
+    # Поддршка за стари и нови верзии на urllib3
+    try:
+        # Нова верзија
+        retry_strategy = Retry(
+            total=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        )
+    except TypeError:
+        # Стара верзија
+        retry_strategy = Retry(
+            total=3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            method_whitelist=["HEAD", "GET", "OPTIONS", "POST"]
+        )
+
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 class WebRTCGameClient:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("🐍 Snake & Ladder - P2P Edition")
         self.root.configure(bg="#2a9d8f")
 
-        # Локални податоци (без server authentication)
+        # Корисник и профил
+        self.current_user = None
+        self.user_data = {}
         self.local_profile = load_local_profile()
         self.display_name = self.local_profile.get("display_name", "Player")
         self.display_avatar = self.local_profile.get("display_avatar", "🙂")
@@ -68,6 +97,9 @@ class WebRTCGameClient:
         # Game instance
         self.game_instance = None
 
+        # HTTP session
+        self.http_session = create_session()
+
         if not WEBRTC_AVAILABLE:
             messagebox.showerror(
                 "Missing Dependencies",
@@ -78,53 +110,208 @@ class WebRTCGameClient:
             self.root.destroy()
             return
 
-        self.show_login_window()
+        # Провери server connection прво
+        self.check_server_connection()
+
+    def check_server_connection(self):
+        """Провери дали серверот работи"""
+        try:
+            response = self.http_session.get(f"{SERVER_URL}/status", timeout=5)
+            if response.status_code == 200:
+                print("✅ Auth server е достапен")
+                self.show_login_window()
+            else:
+                self.show_server_error()
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Auth server не е достапен: {e}")
+            self.show_server_error()
+
+    def show_server_error(self):
+        """Прикажи грешка за сервер и понуди офлајн мод"""
+        self.clear_window()
+        self.root.geometry("500x400")
+        self.root.title("Server Connection Error")
+
+        tk.Label(self.root, text="⚠️ Server Connection Error",
+                 font=("Arial", 18, "bold"), bg="#2a9d8f", fg="#e74c3c").pack(pady=20)
+
+        tk.Label(self.root, text="Не можеме да се поврземе со auth серверот.",
+                 font=("Arial", 12), bg="#2a9d8f", fg="white", wraplength=450).pack(pady=10)
+
+        tk.Label(self.root, text="Проверете дали auth_server.py работи на порт 8000.",
+                 font=("Arial", 10), bg="#2a9d8f", fg="#bdc3c7", wraplength=450).pack(pady=5)
+
+        tk.Button(self.root, text="🔄 Retry Connection", command=self.check_server_connection,
+                  font=("Arial", 14), bg="#3498db", fg="white", padx=20, pady=10).pack(pady=20)
+
+        tk.Button(self.root, text="🎮 Continue Offline", command=self.show_offline_mode,
+                  font=("Arial", 14), bg="#f39c12", fg="white", padx=20, pady=10).pack(pady=10)
+
+        tk.Label(self.root, text="Offline mode: Solo игри само, без P2P мултиплејер",
+                 font=("Arial", 10), bg="#2a9d8f", fg="#95a5a6").pack(pady=10)
+
+    def show_offline_mode(self):
+        """Офлајн мод без server"""
+        self.current_user = "offline_user"
+        self.display_name = self.local_profile.get("display_name", "Player")
+        messagebox.showinfo("Offline Mode", "Работиме во офлајн мод. Достапни се само Solo игри.")
+        self.show_main_menu(offline_mode=True)
 
     def show_login_window(self):
+        """Прикажи login прозорец"""
         self.clear_window()
-        self.root.geometry("400x300")
+        self.root.geometry("450x500")
         self.root.title("Login / Register")
 
-        tk.Label(self.root, text="🐍 Snake & Ladder Login",
-                 font=("Arial", 18, "bold"), bg="#2a9d8f", fg="white").pack(pady=20)
+        # Header
+        header_frame = tk.Frame(self.root, bg="#34495e", height=100)
+        header_frame.pack(fill="x")
+        header_frame.pack_propagate(False)
 
-        tk.Label(self.root, text="Username:", bg="#2a9d8f", fg="white").pack()
-        username_entry = tk.Entry(self.root, font=("Arial", 12))
-        username_entry.pack(pady=5)
+        tk.Label(header_frame, text="🐍 Snake & Ladder",
+                 font=("Arial", 20, "bold"), bg="#34495e", fg="#ecf0f1").pack(pady=15)
+        tk.Label(header_frame, text="P2P Multiplayer Edition",
+                 font=("Arial", 12), bg="#34495e", fg="#95a5a6").pack()
 
-        tk.Label(self.root, text="Password:", bg="#2a9d8f", fg="white").pack()
-        password_entry = tk.Entry(self.root, font=("Arial", 12), show="*")
-        password_entry.pack(pady=5)
+        # Main form
+        form_frame = tk.Frame(self.root, bg="#2a9d8f", padx=40, pady=30)
+        form_frame.pack(expand=True, fill="both")
 
-        def handle_login():
-            u, p = username_entry.get(), password_entry.get()
-            try:
-                r = requests.post(f"{SERVER_URL}/login", json={"username": u, "password": p})
-                if r.status_code == 200:
-                    messagebox.showinfo("Success", "Login Successful!")
-                    self.display_name = u
-                    self.show_main_menu()
-                else:
-                    messagebox.showerror("Error", r.json().get("detail", "Login failed"))
-            except Exception as e:
-                messagebox.showerror("Error", f"Server not reachable: {e}")
+        tk.Label(form_frame, text="Најава / Регистрација", font=("Arial", 16, "bold"),
+                 bg="#2a9d8f", fg="white").pack(pady=20)
 
-        def handle_register():
-            u, p = username_entry.get(), password_entry.get()
-            try:
-                r = requests.post(f"{SERVER_URL}/register", json={"username": u, "password": p})
-                if r.status_code == 200:
-                    messagebox.showinfo("Success", "Registered successfully! Now login.")
-                else:
-                    messagebox.showerror("Error", r.json().get("detail", "Registration failed"))
-            except Exception as e:
-                messagebox.showerror("Error", f"Server not reachable: {e}")
+        # Username
+        tk.Label(form_frame, text="Корисничко име:", font=("Arial", 12, "bold"),
+                 bg="#2a9d8f", fg="white").pack(anchor="w", pady=(10, 5))
 
-        tk.Button(self.root, text="Login", command=handle_login,
-                  font=("Arial", 14), bg="#27ae60", fg="white").pack(pady=10)
+        self.username_entry = tk.Entry(form_frame, font=("Arial", 12), width=25,
+                                       relief=tk.FLAT, bd=5)
+        self.username_entry.pack(pady=5, ipady=8)
 
-        tk.Button(self.root, text="Register", command=handle_register,
-                  font=("Arial", 14), bg="#2980b9", fg="white").pack(pady=5)
+        # Password
+        tk.Label(form_frame, text="Лозинка:", font=("Arial", 12, "bold"),
+                 bg="#2a9d8f", fg="white").pack(anchor="w", pady=(15, 5))
+
+        self.password_entry = tk.Entry(form_frame, font=("Arial", 12), width=25,
+                                       show="*", relief=tk.FLAT, bd=5)
+        self.password_entry.pack(pady=5, ipady=8)
+
+        # Buttons
+        button_frame = tk.Frame(form_frame, bg="#2a9d8f")
+        button_frame.pack(pady=30)
+
+        tk.Button(button_frame, text="🔑 Најави се", command=self.handle_login,
+                  font=("Arial", 14, "bold"), bg="#27ae60", fg="white",
+                  padx=20, pady=10, relief=tk.FLAT, width=12).pack(pady=5)
+
+        tk.Button(button_frame, text="📝 Регистрирај се", command=self.handle_register,
+                  font=("Arial", 14, "bold"), bg="#2980b9", fg="white",
+                  padx=20, pady=10, relief=tk.FLAT, width=12).pack(pady=5)
+
+        tk.Button(button_frame, text="🎮 Офлајн мод", command=self.show_offline_mode,
+                  font=("Arial", 12), bg="#95a5a6", fg="white",
+                  padx=15, pady=8, relief=tk.FLAT, width=12).pack(pady=10)
+
+        # Status
+        self.login_status = tk.Label(form_frame, text="", font=("Arial", 10),
+                                     bg="#2a9d8f", fg="#ecf0f1", wraplength=350)
+        self.login_status.pack(pady=10)
+
+        # Bind Enter клуч
+        self.username_entry.bind("<Return>", lambda e: self.password_entry.focus())
+        self.password_entry.bind("<Return>", lambda e: self.handle_login())
+
+        # Фокус на username
+        self.username_entry.focus()
+
+    def handle_login(self):
+        """Обработи login"""
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+
+        if not username or not password:
+            self.login_status.config(text="Внесете корисничко име и лозинка", fg="#e74c3c")
+            return
+
+        self.login_status.config(text="Се најавувам...", fg="#f1c40f")
+        self.root.update()
+
+        try:
+            response = self.http_session.post(
+                f"{SERVER_URL}/login",
+                json={"username": username, "password": password},
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                self.current_user = result.get("username", username)
+                self.user_data = result.get("user_data", {})
+                self.display_name = self.current_user
+
+                # Зачувај локално
+                self.update_display_profile(name=self.current_user)
+
+                self.login_status.config(text="Успешна најава! 🎉", fg="#27ae60")
+                self.root.after(1500, self.show_main_menu)
+
+            else:
+                error_data = response.json()
+                error_msg = error_data.get("detail", "Неуспешна најава")
+                self.login_status.config(text=f"❌ {error_msg}", fg="#e74c3c")
+
+        except requests.exceptions.Timeout:
+            self.login_status.config(text="❌ Timeout - серверот не одговара", fg="#e74c3c")
+        except requests.exceptions.RequestException as e:
+            self.login_status.config(text=f"❌ Грешка при поврзување", fg="#e74c3c")
+        except Exception as e:
+            self.login_status.config(text=f"❌ Неочекувана грешка", fg="#e74c3c")
+
+    def handle_register(self):
+        """Обработи register"""
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+
+        if not username or not password:
+            self.login_status.config(text="Внесете корисничко име и лозинка", fg="#e74c3c")
+            return
+
+        if len(username) < 3:
+            self.login_status.config(text="Корисничкото име мора да има најмалку 3 карактери", fg="#e74c3c")
+            return
+
+        if len(password) < 4:
+            self.login_status.config(text="Лозинката мора да има најмалку 4 карактери", fg="#e74c3c")
+            return
+
+        self.login_status.config(text="Се регистрирам...", fg="#f1c40f")
+        self.root.update()
+
+        try:
+            response = self.http_session.post(
+                f"{SERVER_URL}/register",
+                json={"username": username, "password": password},
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                self.login_status.config(text="✅ Успешна регистрација! Сега се најавете.", fg="#27ae60")
+                # Исчисти ги полињата
+                self.password_entry.delete(0, tk.END)
+                self.username_entry.focus()
+
+            else:
+                error_data = response.json()
+                error_msg = error_data.get("detail", "Неуспешна регистрација")
+                self.login_status.config(text=f"❌ {error_msg}", fg="#e74c3c")
+
+        except requests.exceptions.Timeout:
+            self.login_status.config(text="❌ Timeout - серверот не одговара", fg="#e74c3c")
+        except requests.exceptions.RequestException as e:
+            self.login_status.config(text=f"❌ Грешка при поврзување", fg="#e74c3c")
+        except Exception as e:
+            self.login_status.config(text=f"❌ Неочекувана грешка", fg="#e74c3c")
 
     def update_display_profile(self, name=None, avatar=None):
         """Ажурирај display профил"""
@@ -142,10 +329,11 @@ class WebRTCGameClient:
         for widget in self.root.winfo_children():
             widget.destroy()
 
-    def show_main_menu(self):
+    def show_main_menu(self, offline_mode=False):
         """Прикажи главно мени"""
         self.clear_window()
         self.root.geometry("600x700")
+        self.root.title(f"Snake & Ladder - {self.display_name}")
 
         # Header
         header_frame = tk.Frame(self.root, bg="#34495e", height=120)
@@ -155,7 +343,8 @@ class WebRTCGameClient:
         tk.Label(header_frame, text="🐍 Snake & Ladder", font=("Arial", 24, "bold"),
                  bg="#34495e", fg="#ecf0f1").pack(pady=10)
 
-        tk.Label(header_frame, text="P2P Edition - Direct Connection", font=("Arial", 12),
+        mode_text = "Offline Mode" if offline_mode else "P2P Edition - Direct Connection"
+        tk.Label(header_frame, text=mode_text, font=("Arial", 12),
                  bg="#34495e", fg="#95a5a6").pack()
 
         tk.Label(header_frame, text=f"Playing as: {self.display_avatar} {self.display_name}",
@@ -173,28 +362,69 @@ class WebRTCGameClient:
                   command=self.play_solo, bg="#e74c3c", fg="white",
                   padx=25, pady=12, width=25, relief=tk.FLAT).pack(pady=10)
 
-        tk.Button(content_frame, text="🌐 Host P2P Game", font=("Arial", 16, "bold"),
-                  command=self.host_p2p_game, bg="#27ae60", fg="white",
-                  padx=25, pady=12, width=25, relief=tk.FLAT).pack(pady=10)
+        if not offline_mode:
+            tk.Button(content_frame, text="🌐 Host P2P Game", font=("Arial", 16, "bold"),
+                      command=self.host_p2p_game, bg="#27ae60", fg="white",
+                      padx=25, pady=12, width=25, relief=tk.FLAT).pack(pady=10)
 
-        tk.Button(content_frame, text="🔗 Join P2P Game", font=("Arial", 16, "bold"),
-                  command=self.join_p2p_game, bg="#3498db", fg="white",
-                  padx=25, pady=12, width=25, relief=tk.FLAT).pack(pady=10)
+            tk.Button(content_frame, text="🔗 Join P2P Game", font=("Arial", 16, "bold"),
+                      command=self.join_p2p_game, bg="#3498db", fg="white",
+                      padx=25, pady=12, width=25, relief=tk.FLAT).pack(pady=10)
+        else:
+            tk.Label(content_frame, text="P2P мултиплејер недостапен во офлајн мод",
+                     font=("Arial", 12), bg="#2c3e50", fg="#e74c3c").pack(pady=10)
 
-        # Profile button
-        tk.Button(content_frame, text="👤 Change Profile", command=self.show_profile_window,
+        # Profile and logout buttons
+        button_frame = tk.Frame(content_frame, bg="#2c3e50")
+        button_frame.pack(pady=20)
+
+        tk.Button(button_frame, text="👤 Change Profile", command=self.show_profile_window,
                   font=("Arial", 14), bg="#9b59b6", fg="white",
-                  padx=15, pady=8, width=20, relief=tk.FLAT).pack(pady=20)
+                  padx=15, pady=8, width=15, relief=tk.FLAT).pack(side=tk.LEFT, padx=5)
+
+        if not offline_mode:
+            tk.Button(button_frame, text="🚪 Logout", command=self.logout,
+                      font=("Arial", 14), bg="#e67e22", fg="white",
+                      padx=15, pady=8, width=10, relief=tk.FLAT).pack(side=tk.RIGHT, padx=5)
 
         # Connection status
-        status_color = {"disconnected": "#e74c3c", "connecting": "#f39c12",
-                        "connected": "#27ae60"}.get(self.connection_state, "#95a5a6")
+        if not offline_mode:
+            status_color = {"disconnected": "#e74c3c", "connecting": "#f39c12",
+                            "connected": "#27ae60"}.get(self.connection_state, "#95a5a6")
+            tk.Label(content_frame, text=f"Status: {self.connection_state.title()}",
+                     font=("Arial", 12), bg="#2c3e50", fg=status_color).pack(pady=10)
 
-        tk.Label(content_frame, text=f"Status: {self.connection_state.title()}",
-                 font=("Arial", 12), bg="#2c3e50", fg=status_color).pack(pady=10)
+        # User stats ако имаме server податоци
+        if self.user_data and not offline_mode:
+            self.show_user_stats(content_frame)
+        else:
+            # Local stats preview
+            self.show_local_stats_preview(content_frame)
 
-        # Local stats preview
-        self.show_local_stats_preview(content_frame)
+    def show_user_stats(self, parent):
+        """Прикажи статистики од серверот"""
+        stats_frame = tk.Frame(parent, bg="#34495e", relief=tk.FLAT, bd=2)
+        stats_frame.pack(pady=15, padx=20, fill="x")
+
+        tk.Label(stats_frame, text="📊 Your Game Statistics",
+                 font=("Arial", 14, "bold"), bg="#34495e", fg="#ecf0f1").pack(pady=8)
+
+        stats_text = (f"Games: {self.user_data.get('games_played', 0)}  •  "
+                      f"Wins: {self.user_data.get('wins', 0)}  •  "
+                      f"Losses: {self.user_data.get('losses', 0)}")
+
+        tk.Label(stats_frame, text=stats_text,
+                 font=("Arial", 11), bg="#34495e", fg="#27ae60").pack(pady=5)
+
+    def logout(self):
+        """Одјави се"""
+        self.current_user = None
+        self.user_data = {}
+        self.cleanup_webrtc()
+        self.show_login_window()
+
+    # [Останатиот код остава ист - сите P2P методи, игра методи, итн.]
+    # Копирајте ги од оригиналниот webrtc_game_client.py:
 
     def show_local_stats_preview(self, parent):
         """Прикажи краток преглед на локални статистики"""

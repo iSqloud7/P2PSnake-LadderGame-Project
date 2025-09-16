@@ -27,6 +27,7 @@ Core libraries:
 
 # Or install from requirements.txt
 - pip install -r requirements.txt
+- pip install fastapi uvicorn requests aiortc websockets pillow
 
 HOST:
 webrtc_client.py ("ws://127.0.0.1:8765")
