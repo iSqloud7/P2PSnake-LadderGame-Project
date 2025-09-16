@@ -10,9 +10,13 @@ import threading
 import json
 import time
 import os
+import requests
 
 # Увези го оригиналниот код
 from webrtc_snake_ladder_game import P2PSnakeLadderGame as SnakeLadderGame
+
+
+SERVER_URL = "http://localhost:8000"
 
 # Увези го WebRTC клиентот
 try:
@@ -74,7 +78,53 @@ class WebRTCGameClient:
             self.root.destroy()
             return
 
-        self.show_main_menu()
+        self.show_login_window()
+
+    def show_login_window(self):
+        self.clear_window()
+        self.root.geometry("400x300")
+        self.root.title("Login / Register")
+
+        tk.Label(self.root, text="🐍 Snake & Ladder Login",
+                 font=("Arial", 18, "bold"), bg="#2a9d8f", fg="white").pack(pady=20)
+
+        tk.Label(self.root, text="Username:", bg="#2a9d8f", fg="white").pack()
+        username_entry = tk.Entry(self.root, font=("Arial", 12))
+        username_entry.pack(pady=5)
+
+        tk.Label(self.root, text="Password:", bg="#2a9d8f", fg="white").pack()
+        password_entry = tk.Entry(self.root, font=("Arial", 12), show="*")
+        password_entry.pack(pady=5)
+
+        def handle_login():
+            u, p = username_entry.get(), password_entry.get()
+            try:
+                r = requests.post(f"{SERVER_URL}/login", json={"username": u, "password": p})
+                if r.status_code == 200:
+                    messagebox.showinfo("Success", "Login Successful!")
+                    self.display_name = u
+                    self.show_main_menu()
+                else:
+                    messagebox.showerror("Error", r.json().get("detail", "Login failed"))
+            except Exception as e:
+                messagebox.showerror("Error", f"Server not reachable: {e}")
+
+        def handle_register():
+            u, p = username_entry.get(), password_entry.get()
+            try:
+                r = requests.post(f"{SERVER_URL}/register", json={"username": u, "password": p})
+                if r.status_code == 200:
+                    messagebox.showinfo("Success", "Registered successfully! Now login.")
+                else:
+                    messagebox.showerror("Error", r.json().get("detail", "Registration failed"))
+            except Exception as e:
+                messagebox.showerror("Error", f"Server not reachable: {e}")
+
+        tk.Button(self.root, text="Login", command=handle_login,
+                  font=("Arial", 14), bg="#27ae60", fg="white").pack(pady=10)
+
+        tk.Button(self.root, text="Register", command=handle_register,
+                  font=("Arial", 14), bg="#2980b9", fg="white").pack(pady=5)
 
     def update_display_profile(self, name=None, avatar=None):
         """Ажурирај display профил"""
